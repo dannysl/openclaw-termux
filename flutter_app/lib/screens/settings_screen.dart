@@ -120,11 +120,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   title: const Text('Setup Storage'),
                   subtitle: Text(_storageGranted
                       ? 'Granted — proot can access /sdcard. Revoke if not needed.'
-                      : 'Allow access to shared storage'),
+                      : 'Not granted (recommended) — tap to grant only if needed'),
                   leading: const Icon(Icons.sd_storage),
                   trailing: _storageGranted
                       ? const Icon(Icons.warning_amber, color: AppColors.statusAmber)
-                      : const Icon(Icons.warning, color: AppColors.statusAmber),
+                      : const Icon(Icons.check_circle, color: AppColors.statusGreen),
                   onTap: () async {
                     await NativeBridge.requestStoragePermission();
                     // Refresh after returning from permission screen

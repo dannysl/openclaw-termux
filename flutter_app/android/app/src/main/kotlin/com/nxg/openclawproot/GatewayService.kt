@@ -274,6 +274,7 @@ class GatewayService : Service() {
     }
 
     private fun stopGateway() {
+        val procToStop: Process?
         synchronized(lock) {
             stopping = true
             restartCount = maxRestarts // Prevent auto-restart
@@ -281,14 +282,36 @@ class GatewayService : Service() {
             uptimeThread = null
             watchdogThread?.interrupt()
             watchdogThread = null
-            gatewayProcess?.let {
-                try {
-                    it.destroyForcibly()
-                } catch (_: Exception) {}
-                gatewayProcess = null
-            }
+            // Interrupt the gateway thread in case it is sleeping during an
+            // auto-restart delay so it wakes up and sees stopping=true.
+            gatewayThread?.interrupt()
+            gatewayThread = null
+            procToStop = gatewayProcess
+            gatewayProcess = null
         }
         emitLog("Gateway stopped by user")
+        // Gracefully terminate proot via SIGTERM first, allowing its --kill-on-exit
+        // handler to kill child processes (node.js / openclaw daemon) before proot
+        // exits.  destroyForcibly() (SIGKILL) bypasses proot's exit handler, which
+        // can leave the gateway daemon alive even after proot is killed.
+        procToStop?.let { proc ->
+            Thread({
+                try {
+                    proc.destroy() // SIGTERM — lets proot clean up its children
+                    if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                        // proot did not exit in time; force-kill the process tree.
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            try {
+                                proc.toHandle().descendants().forEach { it.destroyForcibly() }
+                            } catch (_: Exception) {}
+                        }
+                        proc.destroyForcibly()
+                    }
+                } catch (_: Exception) {
+                    try { proc.destroyForcibly() } catch (_: Exception) {}
+                }
+            }, "gateway-stop").apply { isDaemon = true }.start()
+        }
     }
 
     /** Watchdog: periodically checks if the proot process is alive.
