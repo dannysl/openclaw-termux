@@ -65,7 +65,7 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
         text = 'Node reconnecting...';
         break;
       case NodeStatus.error:
-        text = 'Node error — retrying';
+        text = 'Node error - retrying';
         break;
       default:
         return;
@@ -86,7 +86,7 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  /// App returned to foreground — force connection health check.
+  /// App returned to foreground - force connection health check.
   /// Dart timers freeze while backgrounded, so the watchdog and ping
   /// timers won't have fired.  We must check and reconnect manually.
   Future<void> _onAppResumed() async {
@@ -101,7 +101,7 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {}
 
     if (_state.isPaired && _nodeService.isConnectionStale) {
-      // WebSocket went stale while in background — force reconnect
+      // WebSocket went stale while in background - force reconnect
       await _nodeService.disconnect();
       await _nodeService.connect();
     } else if (!_state.isPaired && !_state.isConnecting) {
@@ -113,7 +113,7 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
     _startWatchdog();
   }
 
-  /// App going to background — ensure the foreground service is running
+  /// App going to background - ensure the foreground service is running
   /// so Android keeps our process alive.
   Future<void> _onAppPaused() async {
     if (_state.isDisabled) return;
@@ -193,11 +193,16 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
     _lastGatewayState = gatewayState;
 
     if (!wasRunning && isRunning && _state.isDisabled) {
-      // Gateway just started - auto-enable node if previously enabled
+      // Gateway just started - auto-enable node if previously enabled.
+      // Drop any cached auth token first: the gateway may have generated or
+      // rotated gateway.auth.token on this start, and reusing a stale value
+      // causes TOKEN_INVALID reconnect loops (#94).
+      _nodeService.clearCachedToken();
       _checkAutoConnect();
     } else if (wasRunning && !isRunning && !_state.isDisabled) {
       // Gateway stopped - disconnect node and stop foreground service
       _stopWatchdog();
+      _nodeService.clearCachedToken();
       _nodeService.disconnect();
       NativeBridge.stopNodeService();
     }
@@ -261,10 +266,10 @@ class NodeProvider extends ChangeNotifier with WidgetsBindingObserver {
       } catch (_) {}
 
       if (!_state.isPaired && !_state.isConnecting) {
-        // Connection dropped — reconnect
+        // Connection dropped - reconnect
         _nodeService.connect();
       } else if (_state.isPaired && _nodeService.isConnectionStale) {
-        // Connection appears alive but no data received — force reconnect
+        // Connection appears alive but no data received - force reconnect
         _nodeService.disconnect().then((_) => _nodeService.connect());
       }
     });

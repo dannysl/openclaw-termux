@@ -23,6 +23,7 @@ class GatewayService : Service() {
     companion object {
         const val CHANNEL_ID = "openclaw_gateway"
         const val NOTIFICATION_ID = 1
+        const val DEFAULT_GATEWAY_PORT = 18789
         var isRunning = false
             private set
         var logSink: EventChannel.EventSink? = null
@@ -30,15 +31,15 @@ class GatewayService : Service() {
         private val mainHandler = Handler(Looper.getMainLooper())
 
         /** Check if the gateway process is actually alive (not just the flag).
-         *  Safe to call from the main thread — no blocking I/O. */
+         *  Safe to call from the main thread - no blocking I/O. */
         fun isProcessAlive(): Boolean {
             val inst = instance ?: return false
             if (!isRunning) return false
             val proc = inst.gatewayProcess
             // If we have a process reference, check if it's actually alive
             if (proc != null) return proc.isAlive
-            // No process ref yet — still in setup phase.
-            // If the gateway thread is alive, setup is ongoing — report true.
+            // No process ref yet - still in setup phase.
+            // If the gateway thread is alive, setup is ongoing - report true.
             // This covers slow devices where dir setup takes a long time.
             val thread = inst.gatewayThread
             if (thread != null && thread.isAlive) return true
@@ -63,6 +64,7 @@ class GatewayService : Service() {
     }
 
     private var gatewayProcess: Process? = null
+    private var resolvedPort: Int = DEFAULT_GATEWAY_PORT
     private var wakeLock: PowerManager.WakeLock? = null
     private var restartCount = 0
     private val maxRestarts = 5
@@ -106,7 +108,7 @@ class GatewayService : Service() {
     }
 
     /** Check if gateway port is already in use (another instance running). */
-    private fun isPortInUse(port: Int = 18789): Boolean {
+    private fun isPortInUse(port: Int = resolvedPort): Boolean {
         return try {
             Socket().use { socket ->
                 socket.connect(InetSocketAddress("127.0.0.1", port), 1000)
@@ -115,6 +117,32 @@ class GatewayService : Service() {
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * Resolve the gateway port from openclaw.json (`gateway.port`).
+     *
+     * Upstream precedence is `--port` > `OPENCLAW_GATEWAY_PORT` > `gateway.port`
+     * > 18789, so the port must never be assumed to be 18789 - otherwise the
+     * port probe, watchdog and notification all track the wrong port when the
+     * user configures a custom one (#124).
+     */
+    private fun readConfiguredPort(): Int {
+        try {
+            val configFile = File(
+                applicationContext.filesDir,
+                "rootfs/ubuntu/root/.openclaw/openclaw.json"
+            )
+            if (!configFile.exists()) return DEFAULT_GATEWAY_PORT
+            val json = org.json.JSONObject(configFile.readText())
+            val gateway = json.optJSONObject("gateway") ?: return DEFAULT_GATEWAY_PORT
+            if (!gateway.has("port")) return DEFAULT_GATEWAY_PORT
+            val port = gateway.optInt("port", DEFAULT_GATEWAY_PORT)
+            if (port in 1..65535) return port
+        } catch (_: Exception) {
+            // Unreadable or malformed config - fall back to the default.
+        }
+        return DEFAULT_GATEWAY_PORT
     }
 
     private fun startGateway() {
@@ -129,10 +157,16 @@ class GatewayService : Service() {
 
         gatewayThread = Thread {
             try {
+                // Resolve the configured port before anything probes it (#124).
+                resolvedPort = readConfiguredPort()
+                if (resolvedPort != DEFAULT_GATEWAY_PORT) {
+                    emitLog("[INFO] Using configured gateway port $resolvedPort")
+                }
+
                 // Check if an existing gateway is already listening on the port.
                 // Moved inside thread to avoid blocking the main thread (#60).
                 if (isPortInUse()) {
-                    emitLog("[INFO] Gateway already running on port 18789, adopting existing instance")
+                    emitLog("[INFO] Gateway already running on port $resolvedPort, adopting existing instance")
                     updateNotificationRunning()
                     startUptimeTicker()
                     startWatchdog()
@@ -146,7 +180,7 @@ class GatewayService : Service() {
 
                 // Recreate all directories (config, tmp, home, lib, proc/sys fakes)
                 // in case Android cleared them after an app update (#40).
-                // This must run before proot — it needs bind-mount targets.
+                // This must run before proot - it needs bind-mount targets.
                 val bootstrapManager = BootstrapManager(applicationContext, filesDir, nativeLibDir)
                 try {
                     bootstrapManager.setupDirectories()
@@ -184,10 +218,10 @@ class GatewayService : Service() {
                 // Abort if stop was requested during setup
                 if (stopping) return@Thread
 
-                // Final check right before launch — another instance may have
+                // Final check right before launch - another instance may have
                 // started between the first check and now
                 if (isPortInUse()) {
-                    emitLog("Gateway already running on port 18789, skipping launch")
+                    emitLog("Gateway already running on port $resolvedPort, skipping launch")
                     updateNotificationRunning()
                     startUptimeTicker()
                     startWatchdog()
@@ -198,7 +232,11 @@ class GatewayService : Service() {
                 synchronized(lock) {
                     if (stopping) return@Thread
                     processStartTime = System.currentTimeMillis()
-                    gatewayProcess = pm.startProotProcess("openclaw gateway --verbose")
+                    // Pass --port explicitly so the bound port always matches the
+                    // port this service probes and reports (#124). --port has the
+                    // highest precedence upstream.
+                    val portArg = if (resolvedPort != DEFAULT_GATEWAY_PORT) " --port $resolvedPort" else ""
+                    gatewayProcess = pm.startProotProcess("openclaw gateway --verbose$portArg")
                 }
                 updateNotificationRunning()
                 emitLog("[INFO] Gateway process spawned")
@@ -218,7 +256,7 @@ class GatewayService : Service() {
                     } catch (_: Exception) {}
                 }.start()
 
-                // Read stderr — log all lines on first attempt for debugging visibility
+                // Read stderr - log all lines on first attempt for debugging visibility
                 val stderrReader = BufferedReader(InputStreamReader(proc.errorStream))
                 val currentRestartCount = restartCount
                 Thread {
@@ -242,7 +280,7 @@ class GatewayService : Service() {
                 // If stop was requested, don't auto-restart
                 if (stopping) return@Thread
 
-                // If the gateway ran for >60s, it was a transient crash — reset counter
+                // If the gateway ran for >60s, it was a transient crash - reset counter
                 if (uptimeMs > 60_000) {
                     restartCount = 0
                 }
@@ -297,7 +335,7 @@ class GatewayService : Service() {
         procToStop?.let { proc ->
             Thread({
                 try {
-                    proc.destroy() // SIGTERM — lets proot clean up its children
+                    proc.destroy() // SIGTERM - lets proot clean up its children
                     if (!proc.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
                         // proot did not exit cleanly; force-kill it.
                         proc.destroyForcibly()
@@ -316,19 +354,19 @@ class GatewayService : Service() {
         watchdogThread?.interrupt()
         watchdogThread = Thread {
             try {
-                // Wait 45s before first check — give the process time to start
+                // Wait 45s before first check - give the process time to start
                 Thread.sleep(45_000)
                 while (!Thread.interrupted() && isRunning && !stopping) {
                     val proc = gatewayProcess
                     if (proc != null && !proc.isAlive) {
-                        // Process died — the waitFor() thread should handle restart,
+                        // Process died - the waitFor() thread should handle restart,
                         // but update the flag in case it's stuck
                         emitLog("[WARN] Watchdog: gateway process not alive")
                         break
                     }
                     // Also check if port is still responding after initial startup
                     if (proc != null && !isPortInUse()) {
-                        emitLog("[WARN] Watchdog: port 18789 not responding")
+                        emitLog("[WARN] Watchdog: port $resolvedPort not responding")
                     }
                     Thread.sleep(15_000) // Check every 15s
                 }
@@ -363,11 +401,11 @@ class GatewayService : Service() {
     }
 
     private fun updateNotificationRunning() {
-        updateNotification("Running on port 18789 \u2022 ${formatUptime()}")
+        updateNotification("Running on port $resolvedPort \u2022 ${formatUptime()}")
     }
 
     /** Emit a log message to the Flutter EventChannel.
-     *  MUST post to main thread — EventSink.success() is not thread-safe. */
+     *  MUST post to main thread - EventSink.success() is not thread-safe. */
     private fun emitLog(message: String) {
         try {
             val ts = java.time.Instant.now().toString()
