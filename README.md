@@ -233,7 +233,7 @@ openclawx status
 openclawx start
 
 # Run onboarding to configure API keys
-openclawx onboarding
+openclawx onboard
 
 # Enter Ubuntu shell
 openclawx shell
@@ -509,7 +509,7 @@ openclawx status
 openclawx setup
 
 # Make sure onboarding is complete
-openclawx onboarding
+openclawx onboard
 ```
 
 ### "os.networkInterfaces" error
